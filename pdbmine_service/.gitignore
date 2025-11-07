@@ -1,0 +1,21 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, build with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Database is too big do don't upload it
+Database.dat
+
+# The Query Data saved to disk
+data/
+
+# Mac related files
+.DS_Store

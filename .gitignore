@@ -1,0 +1,13 @@
+pycache/
+*.pyc
+.venv/
+.DS_Store
+pdbmine_db/pdb/
+pdbmine_db/dssp/
+pdbmine_db/log/
+pdbmine_db/temp/
+*.dat
+*.ent
+*.gz
+*.dssp
+pdbmine_service/DiReDB

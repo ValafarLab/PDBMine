@@ -1,0 +1,23 @@
+rsync:
+  url: "rsync.wwpdb.org"
+  port: 33444
+  onlineDirectory: "ftp/data/structures/divided/pdb/"
+
+results:
+  directory: "/data/ProteinData"
+
+log:
+  directory: "/data/ProteinData/log"
+
+database:
+  directory: "/data/ProteinData"
+  file: "db3_0_1.dat"
+  version: 
+    major: 3
+    minor: 0
+    patch: 1
+
+runtime:
+  perform-sync: true 
+  regenerate-dssp: false
+  limit-proteins: false
