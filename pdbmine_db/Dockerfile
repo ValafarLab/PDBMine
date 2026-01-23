@@ -1,4 +1,4 @@
-FROM python:3.8-slim-buster
+FROM python:3.11-slim-bookworm
 
 WORKDIR /pdbmine
 
@@ -10,7 +10,7 @@ RUN dpkg-reconfigure -f noninteractive tzdata
 COPY requirements.txt requirements.txt
 RUN pip3 install -r requirements.txt
 
-COPY *.py .
+COPY *.py ./
 COPY docker_config.yaml config.yaml
 
 CMD [ "python3", "buildDB.py", "-y", "config.yaml", "-l", "INFO"]

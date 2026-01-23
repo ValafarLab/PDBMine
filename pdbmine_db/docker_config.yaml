@@ -9,6 +9,9 @@ results:
 log:
   directory: "/data/ProteinData/log"
 
+temp:
+  directory: "/data/ProteinData/tmp"
+
 database:
   directory: "/data/ProteinData"
   file: "db3_0_1.dat"

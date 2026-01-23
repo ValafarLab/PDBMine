@@ -574,9 +574,9 @@ def generateDatabase(structure_generator):
         logging.error("{}\n\n".format(str(new_PDB)))
 
       #This is purely to keep the user updated
-      if index % 1000 == 0:
+      if index % 100 == 0:
         text = "Protein {} done.".format(index)
-        print(text)
+        print(text, flush=True)
         logging.info(text)
 
   except StopIteration: #catching the exception
@@ -584,15 +584,18 @@ def generateDatabase(structure_generator):
   
 
   logging.info("Finished generating structures")
+  print("\nFinished generating structures. Writing database files...")
 
   #Write set data
   logging.info("Writing set members...")
+  print("Writing set members...", flush=True)
   set_member_entry = layout_manager.entryData("SetMembers")
   IO.writeToFile(set_member_entry, set_array)
   logging.info("Done")
 
   #Write the jump table
   logging.info("Writing jump table...")
+  print("Writing jump table...", flush=True)
   jump_entry = layout_manager.entryData("JumpTable")
   new_table = generateJumpTable(set_array)
   IO.writeToFile(jump_entry, new_table)
@@ -600,7 +603,9 @@ def generateDatabase(structure_generator):
 
   #Gather data from each intermediate file and load them into the final file
   logging.info("Compiling temp files into final file...")
+  print("Compiling temp files into final database...", flush=True)
   compileSections(layout_manager)
+  print("Done!", flush=True)
   logging.info("Done")
 
   return True
@@ -645,7 +650,9 @@ def generate_dssp_files(regenerate, proteins=[]):
 
   # Unzip everything
   logging.info("Generating DSSP's ...")
+  print("Generating DSSP files...")
   pdbs = set()
+  processed_count = 0
   for p, d, f in os.walk(pdb_dir):
     for file in f:
 
@@ -654,6 +661,9 @@ def generate_dssp_files(regenerate, proteins=[]):
 
         x = re.split("pdb(.{4})\.ent\.gz", file)
         pid = x[1].upper()
+        processed_count += 1
+        if processed_count % 100 == 0:
+          print(f"Processed {processed_count} PDB files...")
         logging.info("Examining PDB %s" % pid)
 
         #if we were provided a subset of proteins check to make sure it's a match before we do anything
@@ -688,6 +698,7 @@ def generate_dssp_files(regenerate, proteins=[]):
               pdbs.add(pid)
         else:
           logging.debug("Skipping zipped PDB file: %s/%s" % (p, file))
+  print(f"\nTotal DSSP files processed: {len(pdbs)} proteins")
   return list(pdbs)
 
 def main(args):
