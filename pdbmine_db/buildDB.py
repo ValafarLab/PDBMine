@@ -11,6 +11,22 @@ import Structs      # database file structures
 import DSSP         # DSSP Row class
 import SQLStructs   # SQL Structure code for DB creation
 import glob         # find DSSP files
+import multiprocessing  # parallel structure generation
+
+#One-time index of the DSSP directory: {PID: [file paths]}. Built once via a
+#single scandir instead of globbing the whole directory once per protein.
+_DSSP_INDEX = None
+
+def _build_dssp_index():
+  global _DSSP_INDEX
+  _DSSP_INDEX = {}
+  dssp_dir = os.path.join(prog_global.config['results']['directory'], 'dssp')
+  with os.scandir(dssp_dir) as it:
+    for entry in it:
+      if entry.name.endswith('.dssp'):
+        pid = entry.name.split('_')[0]
+        _DSSP_INDEX.setdefault(pid, []).append(entry.path)
+  logging.info("Built DSSP index: %d proteins from %s" % (len(_DSSP_INDEX), dssp_dir))
 
 #Process the command line options and return the yaml file
 def process_command_line_options(argv):
@@ -267,9 +283,14 @@ def adjustIndices(entry_list):
 
 #Gets all dssp files for a protein and returns them in order
 def dsspFiles(pdb_name):
-  dssp_dir = os.path.join(prog_global.config['results']['directory'], 'dssp')
-  pattern = os.path.join(dssp_dir, "%s_*.dssp" % pdb_name)
-  dssp_files = sorted(glob.glob(pattern))
+  #Use the prebuilt index (single directory scan) instead of globbing the
+  #entire dssp directory once per protein. With ~400k files in a flat dir,
+  #the glob cost was ~213ms each => ~13 hours across a full build.
+  global _DSSP_INDEX
+  if _DSSP_INDEX is None:
+    _build_dssp_index()
+
+  dssp_files = _DSSP_INDEX.get(pdb_name, [])
 
   sorting_list = []
   for next_file in dssp_files:
@@ -298,7 +319,36 @@ def allDefined(sqlPDB):
 
   return True
 
-#Given a pdb name, find all the relevant DSSP files and 
+#Worker-safe wrapper used by the multiprocessing pool. Mirrors the error
+#tolerance of structureGenerator: returns None on any failure.
+def _safe_generate(pdb_name):
+  try:
+    return generateStructure(pdb_name)
+  except Exception as e:
+    logging.warning("Exception generating structure for %s: %s" % (pdb_name, e))
+    return None
+
+#Quiet the workers so 20+ processes don't flood the shared log file.
+def _worker_init():
+  logging.getLogger().setLevel(logging.WARNING)
+
+#Parallel drop-in for structureGenerator. Parses structures across a process
+#pool (the CPU-heavy part) while the caller writes serially via convert().
+def parallelStructureGenerator(pdb_names, workers):
+  #Build the index in the parent so forked workers inherit it (no re-scan).
+  if _DSSP_INDEX is None:
+    _build_dssp_index()
+
+  pool = multiprocessing.Pool(processes=workers, initializer=_worker_init)
+  try:
+    for new_struct in pool.imap(_safe_generate, list(pdb_names), chunksize=16):
+      if new_struct is not None:
+        yield new_struct
+  finally:
+    pool.close()
+    pool.join()
+
+#Given a pdb name, find all the relevant DSSP files and
 def generateStructure(pdb_name):
   logging.info("Generating structure for %s" % pdb_name)
   dssp_files = dsspFiles(pdb_name)
@@ -653,6 +703,17 @@ def generate_dssp_files(regenerate, proteins=[]):
   print("Generating DSSP files...")
   pdbs = set()
   processed_count = 0
+
+  #Pre-index PIDs that already have DSSP files so we can skip the expensive
+  #gunzip + split for structures we've already processed (single scandir).
+  existing_dssp_pids = set()
+  if not regenerate:
+    with os.scandir(dssp_dir) as it:
+      for entry in it:
+        if entry.name.endswith('.dssp'):
+          existing_dssp_pids.add(entry.name.split('_')[0].upper())
+    logging.info("Found existing DSSP for %d proteins" % len(existing_dssp_pids))
+
   for p, d, f in os.walk(pdb_dir):
     for file in f:
 
@@ -668,6 +729,12 @@ def generate_dssp_files(regenerate, proteins=[]):
 
         #if we were provided a subset of proteins check to make sure it's a match before we do anything
         if len(proteins) == 0 or (len(proteins) > 0 and (pid in proteins) or (pid.lower() in proteins)):
+          #Fast path: if we already have DSSP for this PID and aren't
+          #regenerating, skip the gunzip + split entirely.
+          if not regenerate and pid in existing_dssp_pids:
+            logging.debug("DSSP already exists for %s; skipping unzip/split" % pid)
+            pdbs.add(pid)
+            continue
           #unzip the file
           #TODO: Make this a subprocess command and check for the ent file first
           os.system("gunzip -c %s > %s" % (os.path.join(p, file), os.path.join(p, "pdb%s.ent" % pid)))
@@ -728,9 +795,10 @@ def main(args):
     if 'runtime' in config and 'limit-proteins' in config['runtime'] and config['runtime']['limit-proteins'] is True:
       if 'protein-list' in config:
         logging.info("Using protein list provided")
-        proteins = config['protein-list']
-        logging.info("Protein List")
-        logging.info(proteins)
+        #Use a set so membership checks in generate_dssp_files are O(1)
+        #instead of O(n) per protein (matters for large allow-lists).
+        proteins = set(config['protein-list'])
+        logging.info("Protein List (%d entries)" % len(proteins))
       else:
         logging.info("Unable to limit proteins. No list provided.")
 
@@ -740,7 +808,15 @@ def main(args):
     logging.debug(proteins)
 
     logging.info("Creating protein structures")
-    structure_gen = structureGenerator(proteins)
+    runtime_cfg = config.get('runtime', {}) if isinstance(config, dict) else {}
+    use_parallel = runtime_cfg.get('parallel', True)
+    if use_parallel:
+      workers = runtime_cfg.get('workers', max(1, multiprocessing.cpu_count() - 4))
+      logging.info("Parallel structure generation with %d workers" % workers)
+      structure_gen = parallelStructureGenerator(proteins, workers)
+    else:
+      logging.info("Serial structure generation")
+      structure_gen = structureGenerator(proteins)
     logging.info("Building database")
     generateDatabase(structure_gen)
     logging.info("Database creation complete")

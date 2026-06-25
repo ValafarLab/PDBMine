@@ -1,7 +1,13 @@
 import Structs
 
-import mysql.connector as c
-from mysql.connector import Error
+#The MySQL path is legacy/unused in the file-based (DSSP) build flow. Import it
+#lazily so a missing mysql-connector can't break the whole build.
+try:
+  import mysql.connector as c
+  from mysql.connector import Error
+except ImportError:
+  c = None
+  Error = Exception
 
 #MAX_PRINT_NUM = 20
 
