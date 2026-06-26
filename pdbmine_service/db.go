@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	//Chi Router
 	"github.com/go-chi/chi"
@@ -441,12 +442,28 @@ type ProteinDB struct {
 	Dihedrals    []Dihedral                 `json:"dihedrals"`
 	Residues     string                     `json:"residues"`
 	Redis        redis.Conn                 `json:"-"` //Redis connection is never returned as JSON
+
+	querySem     chan struct{} `json:"-"` //Caps concurrent query execution
+	queryTimeout time.Duration `json:"-"` //Per-query runtime cap
 }
 
 //NewProteinDB creates the ProteinDB structure from a file
 func NewProteinDB(fileName string) (*ProteinDB, error) {
 	db := new(ProteinDB)
 	db.JumpIndexMax = 0
+
+	//Bound concurrent query execution and cap per-query runtime so a shared
+	//server can't be exhausted by a flood of queries or a single runaway one.
+	//Both are configurable via env vars.
+	maxQueries := 8
+	if v, err := strconv.Atoi(os.Getenv("DIREDB_MAX_QUERIES")); err == nil && v > 0 {
+		maxQueries = v
+	}
+	db.querySem = make(chan struct{}, maxQueries)
+	db.queryTimeout = 120 * time.Second
+	if v, err := strconv.Atoi(os.Getenv("DIREDB_QUERY_TIMEOUT")); err == nil && v > 0 {
+		db.queryTimeout = time.Duration(v) * time.Second
+	}
 
 	absFileName, err := filepath.Abs(fileName)
 	if err != nil {
@@ -571,7 +588,38 @@ func NewProteinDB(fileName string) (*ProteinDB, error) {
 	}
 
 	file.Close()
+
+	//The query path's intersection is a linear sorted-merge, which depends on
+	//each set being stored ascending-sorted. Verify that invariant once here so
+	//a database that violates it fails loudly at load instead of silently
+	//returning incomplete query results.
+	if err := db.verifySetMembersSorted(); err != nil {
+		log.Fatal(err)
+		return db, err
+	}
+
 	return db, nil
+}
+
+//verifySetMembersSorted checks that every jump-table entry's set of chain
+//indices is stored ascending-sorted (the invariant FindIntersection relies on).
+//Returns an error on the first violation or out-of-range reference.
+func (db *ProteinDB) verifySetMembersSorted() error {
+	n := len(db.SetMembers)
+	for key, jte := range db.JumpTable {
+		start := int(jte.SetStartIndex)
+		end := start + int(jte.SetNumMembers)
+		if start < 0 || start > end || end > n {
+			return fmt.Errorf("jump entry %v references out-of-range set [%d:%d] (set members len %d)", key, start, end, n)
+		}
+		for i := start + 1; i < end; i++ {
+			if db.SetMembers[i] < db.SetMembers[i-1] {
+				return fmt.Errorf("set members not sorted for jump entry %v at index %d (%d < %d); the query intersection requires ascending-sorted sets", key, i, db.SetMembers[i], db.SetMembers[i-1])
+			}
+		}
+	}
+	log.Printf("Verified set-member sort invariant across %d jump-table entries\n", len(db.JumpTable))
+	return nil
 }
 
 //DatabaseRoutes is the Routes for Proteins

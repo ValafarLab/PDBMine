@@ -209,7 +209,7 @@ func writeModelCSV(chain []AminoAcidRec) ([]byte, error) {
 		"Residue", "Phi", "Psi",
 	}
 	if err := w.Write(line); err != nil {
-		log.Fatalln("error writing record to csv:", err)
+		log.Printf("error writing record to csv: %v", err)
 		return nil, err
 	}
 
@@ -220,7 +220,7 @@ func writeModelCSV(chain []AminoAcidRec) ([]byte, error) {
 			fmt.Sprintf("%.1f", chain[i].Psi),
 		}
 		if err := w.Write(line); err != nil {
-			log.Fatalln("error writing record to csv:", err)
+			log.Printf("error writing record to csv: %v", err)
 			return nil, err
 		}
 	}

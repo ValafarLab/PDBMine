@@ -3,12 +3,14 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"encoding/csv"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -21,6 +23,11 @@ import (
 	//UUID
 	"github.com/google/uuid"
 )
+
+//verboseQuery enables the per-frame / per-match trace logging in the query hot
+//path. Off by default (the logging was a major per-query cost); set the
+//DIREDB_VERBOSE env var to re-enable it for debugging.
+var verboseQuery = os.Getenv("DIREDB_VERBOSE") != ""
 
 //QueryStatus is the status of a query that's running
 type QueryStatus int
@@ -159,21 +166,23 @@ func TranslateToOneLetterCode(threeLetter []string) []string {
 	return oneLetter
 }
 
-//FindIntersection finds the intersection between two sets of integers
+//FindIntersection finds the intersection between two sets of integers.
+//Both inputs are stored ascending-sorted by the builder (ChainSet.toBytes
+//sorts before writing), so this is a linear merge: O(n+m) with no map
+//allocation. The result stays sorted, so chained intersections remain valid.
 func FindIntersection(first []uint32, second []uint32) []uint32 {
 	result := make([]uint32, 0)
-	//Put the first list into a hash
-	firstHash := make(map[uint32]uint8, len(first))
-	for _, entry := range first {
-		firstHash[entry] = 1
-	}
-
-	//check every item of the second list to see if it's in the hash. If it is, then add it to the result
-	for _, entry := range second {
-		_, found := firstHash[entry]
-
-		if found {
-			result = append(result, entry)
+	i, j := 0, 0
+	for i < len(first) && j < len(second) {
+		switch {
+		case first[i] == second[j]:
+			result = append(result, first[i])
+			i++
+			j++
+		case first[i] < second[j]:
+			i++
+		default:
+			j++
 		}
 	}
 
@@ -181,24 +190,27 @@ func FindIntersection(first []uint32, second []uint32) []uint32 {
 }
 
 //NewQuery performs a new query on a request and returns it
-func (db *ProteinDB) NewQuery(query *QueryRequest) (QueryResponse, error) {
+func (db *ProteinDB) NewQuery(ctx context.Context, query *QueryRequest) (QueryResponse, error) {
 	resp := new(QueryResponse)
 	resp.Frames = make(map[string]map[string][][]AminoAcidRec)
 
 	//strip out all white space in the Residue string.
-	strings.Replace(query.Residue, "\t", "", -1)
-	strings.Replace(query.Residue, "\n", "", -1)
-	strings.Replace(query.Residue, " ", "", -1)
+	query.Residue = strings.Replace(query.Residue, "\t", "", -1)
+	query.Residue = strings.Replace(query.Residue, "\n", "", -1)
+	query.Residue = strings.Replace(query.Residue, " ", "", -1)
 
 	//Check the length from the request
 	switch query.Length {
 	case 1:
 		//divide into frames with the length of the window and search for each one.
 		for i := 0; i < len(query.Residue)-query.Window+1; i++ {
+			if err := ctx.Err(); err != nil {
+				return *resp, err
+			}
 			frame := query.Residue[i : i+query.Window]
 			frame = fmt.Sprintf("%03d_%s", i, strings.ToUpper(frame))
 			frameArray := strings.SplitAfter(frame[4:], "") //skip 3 digits and _
-			resp.Frames[frame] = db.SearchForFrame(frameArray)
+			resp.Frames[frame] = db.SearchForFrame(ctx, frameArray)
 		}
 	case 3:
 		if 0 == len(query.Residue)%3 {
@@ -206,12 +218,15 @@ func (db *ProteinDB) NewQuery(query *QueryRequest) (QueryResponse, error) {
 
 			//divide into frames with the length of the window and search for each one.
 			for i := 0; i < len(query.Residue)-3*query.Window+1; i += 3 {
+				if err := ctx.Err(); err != nil {
+					return *resp, err
+				}
 				frame := query.Residue[i : i+query.Window*3]
 				frame = fmt.Sprintf("%03d_%s", i, strings.ToUpper(frame))
 				frameArray := threeCode.FindAllString(frame[4:], -1) //skip 3 digits and _
 				//Convert from three letter code to one letter code
 				oneFrameArray := TranslateToOneLetterCode(frameArray)
-				resp.Frames[frame] = db.SearchForFrame(oneFrameArray)
+				resp.Frames[frame] = db.SearchForFrame(ctx, oneFrameArray)
 			}
 		} else {
 			return *resp, errors.New("residue string is not evenly divisible by 3")
@@ -226,12 +241,19 @@ func (db *ProteinDB) NewQuery(query *QueryRequest) (QueryResponse, error) {
 }
 
 //SearchForFrame searches for frames by comparing sets
-func (db *ProteinDB) SearchForFrame(residues []string) map[string][][]AminoAcidRec {
+func (db *ProteinDB) SearchForFrame(ctx context.Context, residues []string) map[string][][]AminoAcidRec {
 	result := make(map[string][][]AminoAcidRec, 0)
 
-	log.Printf("%v\n", residues)
+	if verboseQuery {
+		log.Printf("%v\n", residues)
+	}
 	//for each starting point to the number of possible residues
 	for i := 0; i < int(db.JumpIndexMax); i++ {
+		//Periodically honor cancellation (per-query timeout) without paying
+		//the check on every single iteration.
+		if i&1023 == 0 && ctx.Err() != nil {
+			return result
+		}
 		//for each residue
 		finalSet := make([]uint32, 0)
 		for j, residue := range residues {
@@ -263,8 +285,9 @@ func (db *ProteinDB) SearchForFrame(residues []string) map[string][][]AminoAcidR
 
 		//i is the starting index inside the chain/model
 		for _, chainNum := range finalSet {
-			log.Printf("Residue found in %s_%s at index %d; %d models", db.Chains[chainNum].SourcePDB, db.Chains[chainNum].ChainID, i, db.Chains[chainNum].NumModels)
-
+			if verboseQuery {
+				log.Printf("Residue found in %s_%s at index %d; %d models", db.Chains[chainNum].SourcePDB, db.Chains[chainNum].ChainID, i, db.Chains[chainNum].NumModels)
+			}
 			tag := fmt.Sprintf("%s_%s", db.Chains[chainNum].SourcePDB, db.Chains[chainNum].ChainID)
 			for j := 0; j < int(db.Chains[chainNum].NumModels); j++ {
 				rIndex := int(db.Chains[chainNum].ResidueIndex) + i
@@ -432,24 +455,36 @@ func writeQueryTarball(record *QueryResponse) ([]byte, error) {
 				summaryLine := generateSummaryLine(protein[0:4], protein[5:6], fmt.Sprintf("%02d", model), record.Frames[frame][protein][model])
 
 				if err := w.Write(summaryLine); err != nil {
-					log.Fatalln("error writing record to csv:", err)
+					log.Printf("error writing record to csv: %v", err)
 					return nil, err
 				}
 
 				//add summary lines to each residue in the frame
 				//frame is of the format ###_CCCC, split this up
 				parts := strings.Split(frame, "_")
-				frameArray := strings.SplitAfter(parts[1], "")
 				frameIndex, err := strconv.Atoi(parts[0])
 				if err != nil {
-					log.Fatalf("Expected a id to be a number. Instead received %s", parts[0])
+					log.Printf("Expected a frame id to be a number. Instead received %s", parts[0])
 					return nil, err
 				}
 
+				//Iterate over the actual matched residues rather than the
+				//characters of the frame name. For 3-letter codes the frame name
+				//holds 3 chars per residue, so indexing by name characters would
+				//run past the residue slice and panic. Derive the per-residue
+				//code length and the residue-unit start index from the data so
+				//this works for both 1- and 3-letter codes.
+				chain := record.Frames[frame][protein][model]
+				codeLen := 1
+				if len(chain) > 0 && len(parts[1])/len(chain) > 0 {
+					codeLen = len(parts[1]) / len(chain)
+				}
+				residueStart := frameIndex / codeLen
+
 				//for each residue in the frame, add a summary line
-				for offset, residue := range frameArray {
-					//key is the frame seq + the offset into the frame
-					resSumKey := fmt.Sprintf("%03d_%s", frameIndex+offset, residue)
+				for offset := 0; offset < len(chain); offset++ {
+					//key is the residue position in the query + the residue letter
+					resSumKey := fmt.Sprintf("%03d_%s", residueStart+offset, chain[offset].Residue)
 
 					//init the slice if one isn't there
 					if _, exists := resSummary[resSumKey]; !exists {
@@ -457,7 +492,7 @@ func writeQueryTarball(record *QueryResponse) ([]byte, error) {
 					}
 
 					//add summary line to slice
-					resLine := generateResSummaryLine(protein[0:4], protein[5:6], fmt.Sprintf("%02d", model), record.Frames[frame][protein][model], offset)
+					resLine := generateResSummaryLine(protein[0:4], protein[5:6], fmt.Sprintf("%02d", model), chain, offset)
 					resSummary[resSumKey] = append(resSummary[resSumKey], resLine)
 				}
 
@@ -568,7 +603,7 @@ func writeResSummaryCSV(lines [][]string) ([]byte, error) {
 
 	for _, line := range lines {
 		if err := w.Write(line); err != nil {
-			log.Fatalln("error writing record to csv:", err)
+			log.Printf("error writing record to csv: %v", err)
 			return nil, err
 		}
 	}

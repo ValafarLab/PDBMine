@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io/ioutil"
@@ -56,7 +57,27 @@ func ReadFromDisk(name string) ([]byte, error) {
 
 //RunAndSaveResults runs the query and saves the result to disk
 func (db *ProteinDB) RunAndSaveResults(post *QueryRequest, queryID string) {
-	resp, err := db.NewQuery(post)
+	//Recover from any panic during query processing so one bad request can't
+	//crash the whole server for everyone. Mark the query as errored instead.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("recovered from panic while running query %s: %v", queryID, r)
+			if db.RedisAvailable() {
+				db.UpdateStatusInRedis(queryID, Error)
+			}
+		}
+	}()
+
+	//Bound concurrent query execution. Queues here if all slots are busy so a
+	//flood of requests can't exhaust CPU/memory for everyone.
+	db.querySem <- struct{}{}
+	defer func() { <-db.querySem }()
+
+	//Cap per-query runtime; SearchForFrame honors this context and bails out.
+	ctx, cancel := context.WithTimeout(context.Background(), db.queryTimeout)
+	defer cancel()
+
+	resp, err := db.NewQuery(ctx, post)
 
 	log.Printf("query %s completed", queryID)
 
@@ -64,6 +85,9 @@ func (db *ProteinDB) RunAndSaveResults(post *QueryRequest, queryID string) {
 
 	if err != nil {
 		log.Println("Error running query", err)
+		if db.RedisAvailable() {
+			db.UpdateStatusInRedis(queryID, Error)
+		}
 		return
 	}
 
